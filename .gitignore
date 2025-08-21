@@ -1,0 +1,6 @@
+# Python cache
+__pycache__/
+
+# Local credentials and tokens - DO NOT COMMIT
+client_secrets.json
+token.pickle
