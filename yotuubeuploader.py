@@ -18,6 +18,7 @@ import threading  # Used to run long tasks (API calls, downloads) without freezi
 import smtplib  # Used for sending emails via SMTP for error notifications.
 from email.message import EmailMessage  # Used to construct the email for error notifications.
 import traceback  # Used to get detailed error information for logging and email alerts.
+import requests # Used to send messages to Discord webhooks.
 
 # --- Third-Party Library Imports ---
 
@@ -62,6 +63,13 @@ ENABLE_EMAIL_ALERTS = True  # Set to False to disable email notifications
 SENDER_EMAIL = "your_email@gmail.com"  # The email address you're sending from
 SENDER_APP_PASSWORD = "your_16_character_app_password"  # The App Password you generated
 RECIPIENT_EMAIL = "crgroblooxfortniteyt@gmail.com" # The email address to send alerts to
+
+# Discord Webhook Configuration
+# 1. In your Discord server, go to Server Settings > Integrations > Webhooks.
+# 2. Click "New Webhook", give it a name (e.g., "YT Uploader Bot"), and choose a channel.
+# 3. Click "Copy Webhook URL" and paste it below.
+ENABLE_DISCORD_NOTIFICATIONS = True # Set to False to disable
+DISCORD_WEBHOOK_URL = "your_discord_webhook_url_here"
 
 
 # ==============================================================================
@@ -330,6 +338,28 @@ def send_error_email(subject, body):
         print("Error email sent successfully.")
     except Exception as e:
         print(f"CRITICAL: Failed to send error email. Error: {e}")
+
+
+def send_discord_notification(message):
+    """
+    Sends a notification message to the configured Discord webhook URL.
+    """
+    if not ENABLE_DISCORD_NOTIFICATIONS or "your_discord_webhook_url_here" in DISCORD_WEBHOOK_URL:
+        print("Discord notifications are not configured. Skipping.")
+        return
+
+    # Discord webhooks expect a JSON payload with a 'content' key.
+    payload = {
+        "content": message
+    }
+
+    try:
+        print(f"Sending notification to Discord...")
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        response.raise_for_status()  # Raise an exception for bad status codes (4xx or 5xx)
+        print("Discord notification sent successfully.")
+    except requests.exceptions.RequestException as e:
+        print(f"CRITICAL: Failed to send Discord notification. Error: {e}")
 
 
 # ==============================================================================
@@ -1160,6 +1190,7 @@ class YouTubeUploaderGUI(tk.Tk):
 
     def worker_upload_videos(self, upload_jobs, schedule_plan):
         """Processes a list of upload jobs (re-uploads or local files) in a worker thread."""
+        successful_uploads = []
         total_videos = len(upload_jobs)
         self.task_queue.put(('STATUS_UPDATE', f'Starting upload of {total_videos} videos...'))
         self.task_queue.put(('PROGRESS_UPDATE', 0))
@@ -1186,11 +1217,14 @@ class YouTubeUploaderGUI(tk.Tk):
             print(f"This video will be scheduled for: {schedule_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
 
             status_callback(f'Uploading video {i+1}/{total_videos}...')
-            upload_video(
+            upload_id = upload_video(
                 self.youtube_service, video_path, job_title, job['description'],
                 tags=["shorts", "your-custom-tag"], channel_name=self.channel_name,
                 publish_at=schedule_iso_string
             )
+
+            if upload_id:
+                successful_uploads.append({'title': job_title, 'id': upload_id})
 
             if job['type'] == 're-upload' and os.path.exists(video_path):
                 os.remove(video_path)
@@ -1200,6 +1234,16 @@ class YouTubeUploaderGUI(tk.Tk):
             progress = ((i + 1) / total_videos) * 100
             self.task_queue.put(('PROGRESS_UPDATE', progress))
         
+        # After all jobs are processed, send a summary notification to Discord
+        if successful_uploads:
+            message_lines = [
+                "✅ **Upload Batch Complete!**",
+                "\nSuccessfully scheduled the following videos:\n"
+            ]
+            for video in successful_uploads:
+                message_lines.append(f"- [{video['title']}](https://www.youtube.com/watch?v={video['id']})")
+            send_discord_notification("\n".join(message_lines))
+
         self.task_queue.put(('UPLOAD_COMPLETE', None))
 
     def process_queue(self):
