@@ -1,40 +1,60 @@
-import os
-import pickle
-import isodate
-import subprocess
-import datetime
-import tkinter as tk
-from tkinter import filedialog
-import json
-from tkcalendar import DateEntry
-from tkinter import ttk, font, messagebox
-import threading
-import queue
-import sys
-import smtplib
-from email.message import EmailMessage
-import traceback
+"""
+Retro Shorts Re-Uploader
 
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload
+A GUI-based application for managing YouTube video uploads.
+Features include re-uploading existing Shorts, uploading local video files,
+a flexible scheduling system with presets, and email alerts for critical errors.
+"""
+
+# --- Standard Library Imports ---
+import os  # Used for interacting with the operating system, like checking file paths.
+import pickle  # Used for serializing and de-serializing Python objects (for the auth token).
+import subprocess  # Used to run external commands, specifically for yt-dlp.
+import datetime  # Used for handling dates and times for scheduling.
+import json  # Used for reading and writing the presets configuration file.
+import sys  # Used to redirect standard output to the GUI's log console.
+import queue  # A thread-safe queue used for communication between the GUI and worker threads.
+import threading  # Used to run long tasks (API calls, downloads) without freezing the GUI.
+import smtplib  # Used for sending emails via SMTP for error notifications.
+from email.message import EmailMessage  # Used to construct the email for error notifications.
+import traceback  # Used to get detailed error information for logging and email alerts.
+
+# --- Third-Party Library Imports ---
+
+# Google API Client Libraries
+from google_auth_oauthlib.flow import InstalledAppFlow  # Handles the OAuth 2.0 authorization flow.
+from google.auth.transport.requests import Request  # Handles HTTP requests for Google authentication.
+from googleapiclient.discovery import build  # Builds a service object for interacting with a Google API.
+from googleapiclient.errors import HttpError  # Custom exception class for Google API errors.
+from googleapiclient.http import MediaFileUpload  # Handles the upload of large media files.
+
+# GUI Libraries
+import tkinter as tk  # The standard Python interface to the Tk GUI toolkit.
+from tkinter import ttk, font, messagebox, filedialog  # Themed widgets, font control, dialog boxes, and file dialogs.
+from tkcalendar import DateEntry  # A third-party calendar widget for date selection.
+
+# Other Libraries
+import isodate  # Used to parse ISO 8601 duration strings from the YouTube API.
+
 
 # --- CONFIGURATION ---
+# This section contains global constants that configure the application's behavior.
+
+# YouTube API settings
 CLIENT_SECRETS_FILE = "client_secrets.json"
 API_NAME = 'youtube'
 API_VERSION = 'v3'
 # Scopes allow the script to manage your YouTube account.
-# youtube.upload is for uploading, youtube.readonly is for reading video details.
-SCOPES = ['https://www.googleapis.com/auth/youtube.upload', 'https://www.googleapis.com/auth/youtube.readonly']
+SCOPES = ['https://www.googleapis.com/auth/youtube.upload',
+          'https://www.googleapis.com/auth/youtube.readonly']
+YOUTUBE_VIDEO_CATEGORY_ID = '22'  # '22' is 'People & Blogs'
 
-# --- EMAIL ALERT CONFIGURATION ---
+# Email Alert Configuration
 # IMPORTANT: For this to work with Gmail, you MUST use an "App Password".
 # 1. Go to your Google Account settings: https://myaccount.google.com/
 # 2. Go to "Security".
 # 3. Enable 2-Step Verification if it's not already on.
-# 4. Go to "App passwords".
+# 4. Go to "App Passwords".
 # 5. Create a new app password for this script and copy the 16-character password.
 # 6. Paste that password into SENDER_APP_PASSWORD below.
 # DO NOT use your regular Google password here.
@@ -44,8 +64,15 @@ SENDER_APP_PASSWORD = "your_16_character_app_password"  # The App Password you g
 RECIPIENT_EMAIL = "crgroblooxfortniteyt@gmail.com" # The email address to send alerts to
 
 
+# ==============================================================================
+# --- CORE APPLICATION LOGIC (NON-GUI) ---
+# ==============================================================================
+
 def get_authenticated_service():
-    """Handles user authentication and returns a YouTube API service object."""
+    """
+    Handles user authentication via OAuth 2.0 and returns a YouTube API service object.
+    It stores and reuses credentials in a 'token.pickle' file.
+    """
     credentials = None
     # The file token.pickle stores the user's access and refresh tokens.
     # It's created automatically when the authorization flow completes for the first time.
@@ -53,26 +80,30 @@ def get_authenticated_service():
         with open('token.pickle', 'rb') as token:
             credentials = pickle.load(token)
     try:
-        # If there are no (valid) credentials available, let the user log in.
+        # If there are no (valid) credentials, or they are expired, let the user log in or refresh.
         if not credentials or not credentials.valid:
             if credentials and credentials.expired and credentials.refresh_token:
+                # If credentials exist but are expired, refresh them.
                 credentials.refresh(Request())
             else:
+                # If no credentials exist, start the OAuth flow.
                 flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS_FILE, SCOPES)
                 credentials = flow.run_local_server(port=0)
-            # Save the credentials for the next run
+            # Save the new or refreshed credentials for the next run.
             with open('token.pickle', 'wb') as token:
                 pickle.dump(credentials, token)
 
+        # Build the service object which will be used to make API calls.
         service = build(API_NAME, API_VERSION, credentials=credentials)
         
-        # Using 'snippet' part to get the title, which serves as the channel name
+        # Fetch the channel's title to use in the uploader signature.
         channels_response = service.channels().list(mine=True, part='snippet').execute()
         channel_title = channels_response['items'][0]['snippet']['title']
 
         return service, channel_title
 
     except Exception as e:
+        # If any part of authentication fails, send an email alert and stop the app.
         error_body = f"An unrecoverable error occurred during the authentication process.\n\n"
         error_body += f"Error: {e}\n\n"
         error_body += "Traceback:\n"
@@ -83,7 +114,10 @@ def get_authenticated_service():
 
 
 def get_channel_shorts(youtube):
-    """Fetches all videos from the user's channel and filters for Shorts."""
+    """
+    Fetches all videos from the user's channel by paginating through the 'uploads' playlist,
+    then filters them to identify Shorts based on their duration (< 61 seconds).
+    """
     print("Fetching videos from your channel to find Shorts...")
     shorts = []
     try:
@@ -96,6 +130,7 @@ def get_channel_shorts(youtube):
         playlist_id = channels_response['items'][0]['contentDetails']['relatedPlaylists']['uploads']
 
         next_page_token = None
+        # Loop through all pages of the playlist results.
         while True:
             playlist_items_response = youtube.playlistItems().list(
                 playlistId=playlist_id,
@@ -104,12 +139,13 @@ def get_channel_shorts(youtube):
                 pageToken=next_page_token
             ).execute()
 
+            # Get a list of video IDs from the current page of results.
             video_ids = [item['contentDetails']['videoId'] for item in playlist_items_response['items']]
             
             if not video_ids:
                 break
 
-            # Get video details, including duration
+            # Make a single API call to get details for all videos on this page.
             videos_response = youtube.videos().list(
                 id=','.join(video_ids),
                 part='snippet,contentDetails'
@@ -117,9 +153,10 @@ def get_channel_shorts(youtube):
 
             for video in videos_response['items']:
                 duration_iso = video['contentDetails']['duration']
+                # Convert ISO 8601 duration format (e.g., "PT1M3S") to seconds.
                 duration_seconds = isodate.parse_duration(duration_iso).total_seconds()
-                # A common way to identify a Short is by its duration (< 61 seconds)
                 if duration_seconds < 61:
+                    # If the video is a Short, add its data to our list.
                     shorts.append({
                         'id': video['id'],
                         'title': video['snippet']['title'],
@@ -127,11 +164,13 @@ def get_channel_shorts(youtube):
                         'published': video['snippet']['publishedAt']
                     })
 
+            # Get the token for the next page, or break the loop if this is the last page.
             next_page_token = playlist_items_response.get('nextPageToken')
             if not next_page_token:
                 break
 
     except HttpError as e:
+        # If the API returns an error, log it and send an email alert.
         print(f"An HTTP error {e.resp.status} occurred: {e.content}")
         error_body = f"An HTTP error occurred while fetching channel shorts.\n\n"
         error_body += f"Status: {e.resp.status}\n"
@@ -145,7 +184,10 @@ def get_channel_shorts(youtube):
 
 
 def download_video(video_id, path='.'):
-    """Downloads a YouTube video by its ID using the yt-dlp library."""
+    """
+    Downloads a YouTube video by its ID using the external 'yt-dlp' command-line tool.
+    This is more robust than using a library like pytube.
+    """
     video_url = f'https://www.youtube.com/watch?v={video_id}'
     print(f"\nAttempting to download video using yt-dlp: {video_url}")
 
@@ -156,7 +198,7 @@ def download_video(video_id, path='.'):
 
     command = [
         'yt-dlp',
-        # Download the best quality mp4 format. For shorts, this is usually a single file.
+        # Download the best quality single-file mp4 format.
         '-f', 'best[ext=mp4]',
         # Specify the exact output file path.
         '-o', filepath,
@@ -165,9 +207,8 @@ def download_video(video_id, path='.'):
 
     try:
         print(f"Executing command: {' '.join(command)}")
-        # Run the command. yt-dlp prints progress to stderr, which will be visible.
-        # We don't need to capture stdout anymore since we've defined the filepath.
-        # We capture stderr to show it in case of an error.
+        # Run the yt-dlp command. check=True will raise an exception if it fails.
+        # capture_output=True hides the command's output unless there's an error.
         subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
 
         # After the command succeeds, verify that the file was actually created.
@@ -177,7 +218,9 @@ def download_video(video_id, path='.'):
 
         print(f"\nSuccessfully downloaded to: {filepath}")
         return filepath
+
     except Exception as e:
+        # If the download fails, log the error and send an email alert.
         print(f"\nAn error occurred during download with yt-dlp: {e}")
         error_body = f"An error occurred while downloading a video with yt-dlp.\n\n"
         error_body += f"Video URL: {video_url}\n"
@@ -198,14 +241,18 @@ def download_video(video_id, path='.'):
 
 
 def upload_video(youtube, file_path, title, description, tags, channel_name, privacy_status="private", publish_at=None):
-    """Uploads a video file to YouTube."""
+    """
+    Uploads a video file to YouTube using the provided metadata.
+    Handles scheduling and adds a custom signature to the description.
+    """
     try:
+        # Construct the 'body' of the API request with the video's metadata.
         body = {
             'snippet': {
                 'title': title,
                 'description': description,
                 'tags': tags,
-                'categoryId': '22'  # '22' is 'People & Blogs'. Change if needed.
+                'categoryId': YOUTUBE_VIDEO_CATEGORY_ID
             },
             'status': {
                 'privacyStatus': privacy_status,
@@ -213,7 +260,7 @@ def upload_video(youtube, file_path, title, description, tags, channel_name, pri
             }
         }
 
-        # Add the custom signature to the description
+        # Append the custom signature to the end of the video description.
         uploader_tag = f"\n\n---\n@CGRofficalcode @{channel_name} used YTUPLOADER"
         body['snippet']['description'] += uploader_tag
 
@@ -223,8 +270,10 @@ def upload_video(youtube, file_path, title, description, tags, channel_name, pri
             body['status']['privacyStatus'] = 'private'
             body['status']['publishAt'] = publish_at
 
+        # Create a MediaFileUpload object to handle the resumable upload of the video file.
         media = MediaFileUpload(file_path, chunksize=-1, resumable=True)
 
+        # Create and execute the API request to insert the video.
         print(f"Uploading '{title}'...")
         request = youtube.videos().insert(
             part=','.join(body.keys()),
@@ -237,6 +286,7 @@ def upload_video(youtube, file_path, title, description, tags, channel_name, pri
         return response['id']
 
     except HttpError as e:
+        # If the upload fails, log the error and send an email alert.
         error_message = e.content.decode('utf-8')
         print(f"An HTTP error {e.resp.status} occurred during upload: {error_message}")
         error_body = f"An HTTP error occurred while uploading a video.\n\n"
@@ -251,11 +301,16 @@ def upload_video(youtube, file_path, title, description, tags, channel_name, pri
 
 
 def send_error_email(subject, body):
-    """Sends an email notification if an error occurs."""
+    """
+    Sends an email notification if an error occurs, using the configured SMTP settings.
+    Checks if email alerts are enabled and properly configured before sending.
+    """
+    # Do not proceed if alerts are disabled or if the config still has default placeholder values.
     if not ENABLE_EMAIL_ALERTS or "your_email@gmail.com" in SENDER_EMAIL or "your_16_character_app_password" in SENDER_APP_PASSWORD:
         print("Email alerts are not configured. Skipping.")
         return
 
+    # Construct the email message.
     msg = EmailMessage()
     msg.set_content(body)
     msg['Subject'] = f"[YT Uploader ERROR] {subject}"
@@ -263,6 +318,7 @@ def send_error_email(subject, body):
     msg['To'] = RECIPIENT_EMAIL
 
     try:
+        # Connect to Gmail's SMTP server over SSL, log in, and send the message.
         print(f"Sending error email to {RECIPIENT_EMAIL}...")
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
@@ -272,18 +328,26 @@ def send_error_email(subject, body):
         print(f"CRITICAL: Failed to send error email. Error: {e}")
 
 
-# --- Custom Dialogs ---
+# ==============================================================================
+# --- GUI HELPER CLASSES & DIALOGS ---
+# ==============================================================================
 
 class ReUploadDialog(tk.Toplevel):
-    """A dialog for managing re-upload metadata."""
+    """A dialog window for editing the metadata of videos selected for re-upload."""
     def __init__(self, parent, shorts_to_edit):
+        """
+        Initializes the dialog.
+        'parent' is the main GUI window, 'shorts_to_edit' is a list of short data dictionaries.
+        """
         super().__init__(parent)
         self.transient(parent)
         self.title("Edit Re-Uploads")
         self.app = parent
         self.result = None
         # Convert list of dicts to a dict keyed by a unique identifier (ID + index)
-        self.video_metadata = {f"{s['id']}_{i}": {"title": s['title'], "description": s['description'], "source_id": s['id']} for i, s in enumerate(shorts_to_edit)}
+        self.video_metadata = {
+            f"{s['id']}_{i}": {"title": s['title'], "description": s['description'], "source_id": s['id']}
+            for i, s in enumerate(shorts_to_edit)}
         self.current_key = None
 
         self.configure(bg=self.app.C_BG)
@@ -293,9 +357,11 @@ class ReUploadDialog(tk.Toplevel):
         self._create_widgets()
         self._populate_listbox()
 
+        # This makes the dialog modal, blocking interaction with the main window until it's closed.
         self.wait_window(self)
 
     def _create_widgets(self):
+        """Creates and arranges all the widgets (listbox, entry fields, buttons) in the dialog."""
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(fill="both", expand=True)
 
@@ -303,7 +369,9 @@ class ReUploadDialog(tk.Toplevel):
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(side="left", fill="y", padx=(0, 10))
         ttk.Label(list_frame, text="Videos to Re-upload").pack(anchor="w")
-        self.video_listbox = tk.Listbox(list_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, selectbackground=self.app.C_ACCENT_RED, relief="flat", exportselection=False)
+        self.video_listbox = tk.Listbox(
+            list_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT,
+            selectbackground=self.app.C_ACCENT_RED, relief="flat", exportselection=False)
         self.video_listbox.pack(fill="y", expand=True)
         self.video_listbox.bind("<<ListboxSelect>>", self._on_video_select)
 
@@ -316,7 +384,8 @@ class ReUploadDialog(tk.Toplevel):
         self.title_entry.pack(fill="x", pady=(0, 10))
 
         ttk.Label(editor_frame, text="Description:").pack(anchor="w")
-        self.desc_text = tk.Text(editor_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, relief="flat", insertbackground=self.app.C_TEXT)
+        self.desc_text = tk.Text(
+            editor_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, relief="flat", insertbackground=self.app.C_TEXT)
         self.desc_text.pack(fill="both", expand=True)
 
         # Bottom buttons
@@ -326,13 +395,19 @@ class ReUploadDialog(tk.Toplevel):
         ttk.Button(button_frame, text="Cancel", command=self.destroy).pack(side="right")
 
     def _populate_listbox(self):
+        """Fills the listbox with the titles of the videos to be edited."""
         for key, data in self.video_metadata.items():
             self.video_listbox.insert(tk.END, data['title'])
+        # Automatically select the first item in the list to show its details.
         if self.video_metadata:
             self.video_listbox.selection_set(0)
             self._on_video_select()
 
     def _on_video_select(self, event=None):
+        """
+        Callback function for when a user clicks on an item in the listbox.
+        It saves the data from the currently displayed item and loads the data for the new selection.
+        """
         selected_indices = self.video_listbox.curselection()
         if not selected_indices:
             return
@@ -363,19 +438,25 @@ class ReUploadDialog(tk.Toplevel):
             self.desc_text.insert("1.0", metadata['description'])
 
     def on_ok(self):
+        """
+        Callback for the 'OK' button. Saves the currently edited item's data,
+        sets the dialog's result to the complete list of edited metadata, and closes the window.
+        """
         self._on_video_select() # Save the currently open file's metadata
         self.result = list(self.video_metadata.values())
         self.destroy()
 
 class LocalUploadDialog(tk.Toplevel):
-    """A dialog for managing local file uploads and their metadata."""
+    """A dialog window for editing the metadata of local video files selected for upload."""
     def __init__(self, parent, file_paths):
+        """Initializes the dialog with a list of local file paths."""
         super().__init__(parent)
         self.transient(parent)
         self.title("Edit Local Uploads")
         self.app = parent
         self.result = None
-        self.file_metadata = {path: {"title": os.path.basename(path).rsplit('.', 1)[0], "description": ""} for path in file_paths}
+        self.file_metadata = {
+            path: {"title": os.path.basename(path).rsplit('.', 1)[0], "description": ""} for path in file_paths}
 
         self.configure(bg=self.app.C_BG)
         self.geometry("800x500")
@@ -385,6 +466,7 @@ class LocalUploadDialog(tk.Toplevel):
         self._populate_listbox()
 
     def _create_widgets(self):
+        """Creates and arranges all the widgets in the dialog."""
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(fill="both", expand=True)
 
@@ -392,7 +474,9 @@ class LocalUploadDialog(tk.Toplevel):
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(side="left", fill="y", padx=(0, 10))
         ttk.Label(list_frame, text="Video Files").pack(anchor="w")
-        self.file_listbox = tk.Listbox(list_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, selectbackground=self.app.C_ACCENT_RED, relief="flat", exportselection=False)
+        self.file_listbox = tk.Listbox(
+            list_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT,
+            selectbackground=self.app.C_ACCENT_RED, relief="flat", exportselection=False)
         self.file_listbox.pack(fill="y", expand=True)
         self.file_listbox.bind("<<ListboxSelect>>", self._on_file_select)
 
@@ -405,7 +489,8 @@ class LocalUploadDialog(tk.Toplevel):
         self.title_entry.pack(fill="x", pady=(0, 10))
 
         ttk.Label(editor_frame, text="Description:").pack(anchor="w")
-        self.desc_text = tk.Text(editor_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, relief="flat", insertbackground=self.app.C_TEXT)
+        self.desc_text = tk.Text(
+            editor_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, relief="flat", insertbackground=self.app.C_TEXT)
         self.desc_text.pack(fill="both", expand=True)
 
         # Bottom buttons
@@ -415,6 +500,7 @@ class LocalUploadDialog(tk.Toplevel):
         ttk.Button(button_frame, text="Cancel", command=self.destroy).pack(side="right")
 
     def _populate_listbox(self):
+        """Fills the listbox with the basenames of the selected video files."""
         for path in self.file_metadata.keys():
             self.file_listbox.insert(tk.END, os.path.basename(path))
         if self.file_metadata:
@@ -422,6 +508,10 @@ class LocalUploadDialog(tk.Toplevel):
             self._on_file_select()
 
     def _on_file_select(self, event=None):
+        """
+        Callback for when a user clicks on a file in the listbox.
+        Saves the data for the previous item and loads the data for the new selection.
+        """
         selected_indices = self.file_listbox.curselection()
         if not selected_indices:
             return
@@ -444,6 +534,7 @@ class LocalUploadDialog(tk.Toplevel):
             self.desc_text.insert("1.0", metadata['description'])
 
     def on_ok(self):
+        """Callback for the 'OK' button. Saves final data and closes the window."""
         self._on_file_select() # Save the currently open file's metadata
         self.result = list(self.file_metadata.values())
         self.destroy()
@@ -451,7 +542,10 @@ class LocalUploadDialog(tk.Toplevel):
 # --- Preset Management ---
 
 class PresetManager:
-    """Handles loading and saving of scheduling presets from a JSON file."""
+    """
+    A helper class that handles loading and saving of scheduling presets from a JSON file.
+    This abstracts the file I/O away from the GUI logic.
+    """
     def __init__(self, filename='scheduling_presets.json'):
         self.filename = filename
         self.presets = self.load()
@@ -496,7 +590,7 @@ class PresetManager:
 # --- Preset Management Dialog ---
 
 class PresetManagementDialog(tk.Toplevel):
-    """A dialog for adding, updating, and deleting scheduling presets."""
+    """A dialog window that allows the user to add, update, and delete scheduling presets."""
     def __init__(self, parent, preset_manager):
         super().__init__(parent)
         self.transient(parent)
@@ -513,6 +607,7 @@ class PresetManagementDialog(tk.Toplevel):
         self._populate_listbox()
 
     def _create_widgets(self):
+        """Creates and arranges all the widgets for the preset editor."""
         main_frame = ttk.Frame(self, padding="10")
         main_frame.pack(fill="both", expand=True)
 
@@ -520,7 +615,9 @@ class PresetManagementDialog(tk.Toplevel):
         list_frame = ttk.Frame(main_frame)
         list_frame.pack(side="left", fill="y", padx=(0, 10))
         ttk.Label(list_frame, text="Presets").pack(anchor="w")
-        self.preset_listbox = tk.Listbox(list_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT, selectbackground=self.app.C_ACCENT_RED, relief="flat", exportselection=False)
+        self.preset_listbox = tk.Listbox(
+            list_frame, bg=self.app.C_LIST_BG, fg=self.app.C_TEXT,
+            selectbackground=self.app.C_ACCENT_RED, relief="flat", exportselection=False)
         self.preset_listbox.pack(fill="y", expand=True)
         self.preset_listbox.bind("<<ListboxSelect>>", self._populate_fields_from_selection)
 
@@ -585,7 +682,10 @@ class PresetManagementDialog(tk.Toplevel):
             self.interval_spinbox.set(str(preset_data.get("interval_days", 7)))
 
     def _on_add_update(self):
-        """Saves the preset currently defined in the editor fields."""
+        """
+        Callback for the 'Add / Update' button.
+        Saves the preset currently defined in the editor fields to the JSON file.
+        """
         name = self.name_entry.get().strip()
         if not name:
             messagebox.showerror("Invalid Input", "Preset name cannot be empty.", parent=self)
@@ -609,7 +709,10 @@ class PresetManagementDialog(tk.Toplevel):
             pass # Item might have been renamed
 
     def _on_delete(self):
-        """Deletes the currently selected preset."""
+        """
+        Callback for the 'Delete' button.
+        Removes the currently selected preset from the list and the JSON file.
+        """
         selected_indices = self.preset_listbox.curselection()
         if not selected_indices:
             print("No preset selected to delete.")
@@ -625,7 +728,7 @@ class PresetManagementDialog(tk.Toplevel):
 # --- Scheduling Dialog ---
 
 class SchedulingDialog(tk.Toplevel):
-    """A dialog for choosing scheduling options (Manual or Preset)."""
+    """A dialog window with tabs for choosing scheduling options (Manual or Preset)."""
     def __init__(self, parent, preset_manager):
         super().__init__(parent)
         self.transient(parent)
@@ -638,6 +741,7 @@ class SchedulingDialog(tk.Toplevel):
         self.configure(bg=parent.C_BG)
         self.grab_set()
 
+        # Use a Notebook widget to create a tabbed interface.
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(pady=10, padx=10, fill="both", expand=True)
 
@@ -660,6 +764,7 @@ class SchedulingDialog(tk.Toplevel):
         self.wait_window(self)
 
     def _create_manual_tab(self, parent):
+        """Creates the widgets for the 'Manual Schedule' tab."""
         ttk.Label(parent, text="First Upload Date:").grid(row=0, column=0, sticky="w", pady=2)
         self.date_entry = DateEntry(parent, width=12, background=self.parent.C_ACCENT_RED, foreground='white', borderwidth=2)
         self.date_entry.grid(row=0, column=1, sticky="w", pady=2)
@@ -684,6 +789,7 @@ class SchedulingDialog(tk.Toplevel):
         ttk.Label(interval_frame, text="days").pack(side="left", padx=2)
 
     def _create_preset_tab(self, parent):
+        """Creates the widgets for the 'Use Preset' tab."""
         ttk.Label(parent, text="Select a Preset:").pack(anchor="w", pady=2)
         self.preset_combo = ttk.Combobox(parent, values=self.preset_manager.get_preset_names(), state="readonly")
         self.preset_combo.pack(fill="x", pady=2)
@@ -702,7 +808,10 @@ class SchedulingDialog(tk.Toplevel):
             self.preset_combo.current(0)
 
     def _calculate_start_datetime_from_preset(self, preset_name):
-        """Calculates the first upload datetime based on a preset's rules."""
+        """
+        Calculates the first upload datetime based on a preset's rules.
+        For example, it finds the date of the "next Sunday".
+        """
         preset = self.preset_manager.presets[preset_name]
         days_map = {day: i for i, day in enumerate(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"])}
         target_weekday = days_map[preset['start_day']]
@@ -719,7 +828,10 @@ class SchedulingDialog(tk.Toplevel):
         return first_schedule_date.replace(hour=preset['hour'], minute=preset['minute'], second=0, microsecond=0)
 
     def on_ok(self):
-        """Processes the selected schedule and sets the result."""
+        """
+        Callback for the 'OK' button. Processes the selected schedule from the active tab,
+        sets the dialog's result, and closes the window.
+        """
         selected_tab_index = self.notebook.index(self.notebook.select())
 
         # Manual Tab
@@ -743,10 +855,16 @@ class SchedulingDialog(tk.Toplevel):
         self.result = {'start_datetime': start_datetime, 'interval': interval}
         self.destroy()
 
-# --- GUI Application ---
+
+# ==============================================================================
+# --- MAIN GUI APPLICATION CLASS ---
+# ==============================================================================
 
 class RedirectStdout:
-    """A helper class to redirect stdout to a tkinter Text widget."""
+    """
+    A helper class to redirect the standard output (e.g., `print()` statements)
+    to a tkinter Text widget. This allows the user to see console output in the GUI.
+    """
     def __init__(self, widget):
         self.widget = widget
 
@@ -758,6 +876,7 @@ class RedirectStdout:
         pass  # Required for stdout redirection
 
 class YouTubeUploaderGUI(tk.Tk):
+    """The main application class, which inherits from tkinter's root window."""
     def __init__(self):
         super().__init__()
         self.title("Retro Shorts Re-Uploader")
@@ -794,21 +913,28 @@ class YouTubeUploaderGUI(tk.Tk):
     def _setup_styles(self):
         style = ttk.Style(self)
         style.theme_use('clam')
-        style.configure(".", background=self.C_BG, foreground=self.C_TEXT, fieldbackground=self.C_LIST_BG, borderwidth=0, lightcolor=self.C_BG, darkcolor=self.C_BG)
+        style.configure(".", background=self.C_BG, foreground=self.C_TEXT,
+                        fieldbackground=self.C_LIST_BG, borderwidth=0,
+                        lightcolor=self.C_BG, darkcolor=self.C_BG)
         
-        style.configure("TButton", background=self.C_ACCENT_RED, foreground="white", padding=8, borderwidth=0, font=self.FONT_UI_BOLD)
+        style.configure("TButton", background=self.C_ACCENT_RED, foreground="white",
+                        padding=8, borderwidth=0, font=self.FONT_UI_BOLD)
         style.map("TButton", background=[('active', self.C_ACCENT_RED_ACTIVE), ('disabled', self.C_DISABLED)])
         style.configure("Small.TButton", padding=4, font=self.FONT_UI)
 
-        style.configure("Treeview", background=self.C_LIST_BG, foreground=self.C_TEXT, rowheight=25, fieldbackground=self.C_LIST_BG)
-        style.configure("Treeview.Heading", background=self.C_HEADER_BG, foreground=self.C_TEXT, font=self.FONT_UI_BOLD, padding=5)
+        style.configure("Treeview", background=self.C_LIST_BG, foreground=self.C_TEXT,
+                        rowheight=25, fieldbackground=self.C_LIST_BG)
+        style.configure("Treeview.Heading", background=self.C_HEADER_BG,
+                        foreground=self.C_TEXT, font=self.FONT_UI_BOLD, padding=5)
         style.map("Treeview.Heading", background=[('active', '#4c4c4c')])
         style.map("Treeview", background=[('selected', self.C_ACCENT_RED)], foreground=[('selected', 'white')])
 
-        style.configure("Vertical.TScrollbar", background=self.C_HEADER_BG, troughcolor=self.C_BG, bordercolor=self.C_BG, arrowcolor=self.C_TEXT)
+        style.configure("Vertical.TScrollbar", background=self.C_HEADER_BG,
+                        troughcolor=self.C_BG, bordercolor=self.C_BG, arrowcolor=self.C_TEXT)
         style.map("Vertical.TScrollbar", background=[('active', self.C_ACCENT_RED)])
 
-        style.configure("TProgressbar", troughcolor=self.C_LIST_BG, background=self.C_ACCENT_RED, thickness=10, borderwidth=0)
+        style.configure("TProgressbar", troughcolor=self.C_LIST_BG,
+                        background=self.C_ACCENT_RED, thickness=10, borderwidth=0)
         style.configure("Status.TLabel", foreground=self.C_TEXT, font=self.FONT_UI)
         style.configure("TPanedwindow", background=self.C_BG)
 
@@ -838,10 +964,12 @@ class YouTubeUploaderGUI(tk.Tk):
         self.local_upload_button = ttk.Button(top_frame, text="UPLOAD FROM PC", command=self.start_local_upload_flow)
         self.local_upload_button.pack(side=tk.LEFT, padx=20)
 
-        selection_help_label = ttk.Label(top_frame, text="Use Ctrl+Click or Shift+Click to select multiple items.", style="Status.TLabel")
+        selection_help_label = ttk.Label(
+            top_frame, text="Use Ctrl+Click or Shift+Click to select multiple items.", style="Status.TLabel")
         selection_help_label.pack(side=tk.LEFT, padx=20)
 
-        self.upload_button = ttk.Button(top_frame, text="SCHEDULE RE-UPLOADS", command=self.start_upload_thread, state=tk.DISABLED)
+        self.upload_button = ttk.Button(
+            top_frame, text="SCHEDULE RE-UPLOADS", command=self.start_upload_thread, state=tk.DISABLED)
         self.upload_button.pack(side=tk.RIGHT)
 
     def _create_main_paned_window(self):
@@ -892,8 +1020,9 @@ class YouTubeUploaderGUI(tk.Tk):
         clear_log_button = ttk.Button(log_header, text="CLEAR LOG", command=self.clear_log, style="Small.TButton")
         clear_log_button.pack(side=tk.RIGHT)
 
-        self.log_text = tk.Text(log_container, height=10, bg="#111111", fg=self.C_TEXT, relief=tk.FLAT, font=self.FONT_LOG,
-                                insertbackground=self.C_TEXT, selectbackground=self.C_ACCENT_RED)
+        self.log_text = tk.Text(
+            log_container, height=10, bg="#111111", fg=self.C_TEXT, relief="flat",
+            font=self.FONT_LOG, insertbackground=self.C_TEXT, selectbackground=self.C_ACCENT_RED)
         self.log_text.grid(row=1, column=0, sticky="nsew", pady=(5,0))
         return log_container
 
@@ -905,7 +1034,8 @@ class YouTubeUploaderGUI(tk.Tk):
         status_label = ttk.Label(status_frame, textvariable=self.status_var, style="Status.TLabel")
         status_label.pack(side=tk.LEFT)
 
-        self.progress_bar = ttk.Progressbar(status_frame, orient='horizontal', mode='determinate', variable=self.progress_var)
+        self.progress_bar = ttk.Progressbar(
+            status_frame, orient='horizontal', mode='determinate', variable=self.progress_var)
         self.progress_bar.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=10)
 
     def set_controls_state(self, state):
@@ -1014,41 +1144,49 @@ class YouTubeUploaderGUI(tk.Tk):
         self.set_controls_state(tk.DISABLED)
         threading.Thread(target=self.worker_upload_videos, args=(upload_jobs, schedule_plan), daemon=True).start()
 
+    def _process_reupload_job(self, job, status_update_callback):
+        """Handles the download part of a re-upload job."""
+        status_update_callback(f'Downloading: {job["title"][:30]}...')
+        return download_video(job['source_id'])
+
+    def _process_local_upload_job(self, job, status_update_callback):
+        """Handles the source path for a local upload job."""
+        status_update_callback(f'Preparing: {job["title"][:30]}...')
+        return job['source_path']
+
     def worker_upload_videos(self, upload_jobs, schedule_plan):
+        """Processes a list of upload jobs (re-uploads or local files) in a worker thread."""
         total_videos = len(upload_jobs)
         self.task_queue.put(('STATUS_UPDATE', f'Starting upload of {total_videos} videos...'))
         self.task_queue.put(('PROGRESS_UPDATE', 0))
 
         print(f"\n--- Preparing to process {len(upload_jobs)} video(s). ---")
         for i, job in enumerate(upload_jobs):
-            print(f"\n--- Processing Video {i + 1}/{len(upload_jobs)}: '{job['title']}' ---")
+            job_title = job['title']
+            print(f"\n--- Processing Video {i + 1}/{total_videos}: '{job_title}' ---")
             
+            status_callback = lambda msg: self.task_queue.put(('STATUS_UPDATE', msg))
+
             if job['type'] == 're-upload':
-                self.task_queue.put(('STATUS_UPDATE', f'Downloading video {i+1}/{total_videos}: {job["title"][:30]}...'))
-                video_path = download_video(job['source_id'])
-            else: # local upload
-                video_path = job['source_path']
+                video_path = self._process_reupload_job(job, status_callback)
+            else:  # local upload
+                video_path = self._process_local_upload_job(job, status_callback)
 
             if not video_path:
-                print(f"Could not find or download video source for '{job['title']}'. Skipping.")
+                print(f"Could not find or download video source for '{job_title}'. Skipping.")
                 continue
 
-            self.task_queue.put(('STATUS_UPDATE', f'Scheduling video {i+1}/{total_videos}...'))
+            status_callback(f'Scheduling video {i+1}/{total_videos}...')
             schedule_datetime = schedule_plan['start_datetime'] + (i * schedule_plan['interval'])
             schedule_iso_string = schedule_datetime.isoformat() + "Z"
-
             print(f"This video will be scheduled for: {schedule_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            base_title = job['title']
-            suffix = " (Re-upload)"
-            available_len = 100 - len(suffix)
-            if len(base_title) > available_len:
-                base_title = base_title[:available_len - 3] + "..."
-            new_title = f"{base_title}{suffix}"
-            
-            self.task_queue.put(('STATUS_UPDATE', f'Uploading video {i+1}/{total_videos}...'))
-            upload_video(self.youtube_service, video_path, new_title, job['description'], 
-                         tags=["shorts", "your-custom-tag"], channel_name=self.channel_name, publish_at=schedule_iso_string)
+            status_callback(f'Uploading video {i+1}/{total_videos}...')
+            upload_video(
+                self.youtube_service, video_path, job_title, job['description'],
+                tags=["shorts", "your-custom-tag"], channel_name=self.channel_name,
+                publish_at=schedule_iso_string
+            )
 
             if job['type'] == 're-upload' and os.path.exists(video_path):
                 os.remove(video_path)
