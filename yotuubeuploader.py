@@ -189,7 +189,7 @@ def download_video(video_id, path='.'):
     This is more robust than using a library like pytube.
     """
     video_url = f'https://www.youtube.com/watch?v={video_id}'
-    print(f"\nAttempting to download video using yt-dlp: {video_url}")
+    print(f"\nAttempting to download video in highest quality (up to 4K) using yt-dlp: {video_url}")
 
     # Define a clean, predictable filename. We expect an mp4 file.
     # This avoids parsing yt-dlp output and potential filesystem character issues.
@@ -198,9 +198,13 @@ def download_video(video_id, path='.'):
 
     command = [
         'yt-dlp',
-        # Download the best quality single-file mp4 format.
-        '-f', 'best[ext=mp4]',
-        # Specify the exact output file path.
+        # Select the best video and best audio streams separately and merge them.
+        # This is required to get resolutions higher than 1080p (like 4K).
+        # Fallback to the single best file if merging is not possible.
+        '-f', 'bestvideo+bestaudio/best',
+        # Ensure the final merged file is in the mp4 container format.
+        '--merge-output-format', 'mp4',
+        # Specify the exact output file path, including the .mp4 extension.
         '-o', filepath,
         video_url
     ]
