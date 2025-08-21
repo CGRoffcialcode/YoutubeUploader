@@ -207,11 +207,11 @@ def download_video(video_id, path='.'):
     command = [
         'yt-dlp',
         # Select the best video and best audio streams separately and merge them.
-        # This is required to get resolutions higher than 1080p (like 4K).
-        # Fallback to the single best file if merging is not possible.
         '-f', 'bestvideo+bestaudio/best',
-        # Ensure the final merged file is in the mp4 container format.
-        '--merge-output-format', 'mp4',
+        # After downloading and merging, re-encode the video into a standard MP4.
+        # This is more robust than --merge-output-format and fixes codec issues.
+        # It ensures maximum compatibility with YouTube's uploader.
+        '--recode-video', 'mp4',
         # Specify the exact output file path, including the .mp4 extension.
         '-o', filepath,
         video_url
@@ -273,7 +273,7 @@ def upload_video(youtube, file_path, title, description, tags, channel_name, pri
         }
 
         # Append the custom signature to the end of the video description.
-        uploader_tag = f"\n\n---\n@CGRofficalcode @{channel_name} used YTUPLOADER"
+        uploader_tag = f"\n\n---\n@CGRcodeYT @{channel_name} used YTUPLOADER"
         body['snippet']['description'] += uploader_tag
 
         # If a publish time is provided, set the video to private and add the schedule time.
