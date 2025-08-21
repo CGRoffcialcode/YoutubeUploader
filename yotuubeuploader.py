@@ -220,39 +220,51 @@ def download_video(video_id, path='.'):
         video_url
     ]
 
+    # --- Attempt 1: High-Quality (4K) Download ---
     try:
-        print(f"Executing command: {' '.join(command)}")
-        # Run the yt-dlp command. check=True will raise an exception if it fails.
-        # capture_output=True hides the command's output unless there's an error.
+        print(f"Executing command (4K attempt): {' '.join(command)}")
         subprocess.run(command, check=True, capture_output=True, text=True, encoding='utf-8')
 
-        # After the command succeeds, verify that the file was actually created.
-        if not os.path.exists(filepath):
-             print(f"\nError: yt-dlp reported success, but the file was not found at '{filepath}'")
-             return None
+    except subprocess.CalledProcessError as e:
+        # This block runs if the high-quality download fails.
+        print("\nWarning: Highest quality (4K) download failed. This can happen with certain video codecs.")
+        print("Attempting a fallback download in a more compatible format (max 1080p)...")
+        # Print the specific error message from yt-dlp for better debugging.
+        last_error_line = e.stderr.strip().splitlines()[-1]
+        print(f"Original error: {last_error_line}")
 
-        print(f"\nSuccessfully downloaded to: {filepath}")
-        return filepath
+        # --- Attempt 2: Safe Fallback (Max 1080p) Command ---
+        safe_command = [
+            'yt-dlp',
+            # Get the best pre-merged MP4 file. This is usually 1080p or 720p and highly compatible.
+            '-f', 'best[ext=mp4]/best',
+            '-o', filepath,
+            video_url
+        ]
+        try:
+            print(f"Executing command (safe mode): {' '.join(safe_command)}")
+            subprocess.run(safe_command, check=True, capture_output=True, text=True, encoding='utf-8')
+        except Exception as final_e:
+            # If the safe mode also fails, then we report the final error.
+            print(f"\nAn error occurred during download with yt-dlp (safe mode also failed): {final_e}")
+            error_body = f"An error occurred while downloading a video with yt-dlp (both 4K and safe mode failed).\n\n"
+            error_body += f"Video URL: {video_url}\n"
+            error_body += f"Error: {final_e}\n\n"
+            if isinstance(final_e, subprocess.CalledProcessError):
+                print(f"Error Output:\n{final_e.stderr}")
+                error_body += f"yt-dlp stderr:\n{final_e.stderr}\n\n"
+            error_body += "Traceback:\n"
+            error_body += traceback.format_exc()
+            send_error_email("Video Download Failure", error_body)
+            return None
 
-    except Exception as e:
-        # If the download fails, log the error and send an email alert.
-        print(f"\nAn error occurred during download with yt-dlp: {e}")
-        error_body = f"An error occurred while downloading a video with yt-dlp.\n\n"
-        error_body += f"Video URL: {video_url}\n"
-        error_body += f"Error: {e}\n\n"
-        if isinstance(e, subprocess.CalledProcessError):
-            # yt-dlp prints useful errors to stderr, which is more informative.
-            print(f"Error Output:\n{e.stderr}")
-            error_body += f"yt-dlp stderr:\n{e.stderr}\n\n"
-        if isinstance(e, FileNotFoundError):
-            print("\nError: 'yt-dlp' command not found.")
-            print("Please ensure yt-dlp is installed and in your system's PATH.")
-            print("You can install it using: pip install yt-dlp")
-            error_body += "Error: 'yt-dlp' command not found.\n"
-        error_body += "Traceback:\n"
-        error_body += traceback.format_exc()
-        send_error_email("Video Download Failure", error_body)
-        return None
+    # After either the 4K or safe mode download succeeds, verify the file exists.
+    if not os.path.exists(filepath):
+         print(f"\nError: yt-dlp reported success, but the file was not found at '{filepath}'")
+         return None
+
+    print(f"\nSuccessfully downloaded to: {filepath}")
+    return filepath
 
 
 def upload_video(youtube, file_path, title, description, tags, channel_name, privacy_status="private", publish_at=None):
@@ -261,12 +273,18 @@ def upload_video(youtube, file_path, title, description, tags, channel_name, pri
     Handles scheduling and adds a custom signature to the description.
     """
     try:
+        # Ensure 'tags' is a mutable list and add the custom YTUPLOADER tag.
+        # The YouTube API expects a list of strings for tags (without the '#').
+        final_tags = list(tags) if tags else []
+        if "YTUPLOADER" not in final_tags:
+            final_tags.append("YTUPLOADER")
+
         # Construct the 'body' of the API request with the video's metadata.
         body = {
             'snippet': {
                 'title': title,
                 'description': description,
-                'tags': tags,
+                'tags': final_tags,
                 'categoryId': YOUTUBE_VIDEO_CATEGORY_ID
             },
             'status': {
