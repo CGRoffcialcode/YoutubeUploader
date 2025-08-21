@@ -1199,37 +1199,49 @@ class YouTubeUploaderGUI(tk.Tk):
         for i, job in enumerate(upload_jobs):
             job_title = job['title']
             print(f"\n--- Processing Video {i + 1}/{total_videos}: '{job_title}' ---")
-            
-            status_callback = lambda msg: self.task_queue.put(('STATUS_UPDATE', msg))
+            video_path = None  # Initialize to ensure it exists for the 'finally' block
 
-            if job['type'] == 're-upload':
-                video_path = self._process_reupload_job(job, status_callback)
-            else:  # local upload
-                video_path = self._process_local_upload_job(job, status_callback)
+            try:
+                status_callback = lambda msg: self.task_queue.put(('STATUS_UPDATE', msg))
 
-            if not video_path:
-                print(f"Could not find or download video source for '{job_title}'. Skipping.")
-                continue
+                if job['type'] == 're-upload':
+                    video_path = self._process_reupload_job(job, status_callback)
+                else:  # local upload
+                    video_path = self._process_local_upload_job(job, status_callback)
 
-            status_callback(f'Scheduling video {i+1}/{total_videos}...')
-            schedule_datetime = schedule_plan['start_datetime'] + (i * schedule_plan['interval'])
-            schedule_iso_string = schedule_datetime.isoformat() + "Z"
-            print(f"This video will be scheduled for: {schedule_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
+                if not video_path:
+                    print(f"Could not find or download video source for '{job_title}'. Skipping.")
+                    continue
 
-            status_callback(f'Uploading video {i+1}/{total_videos}...')
-            upload_id = upload_video(
-                self.youtube_service, video_path, job_title, job['description'],
-                tags=["shorts", "your-custom-tag"], channel_name=self.channel_name,
-                publish_at=schedule_iso_string
-            )
+                status_callback(f'Scheduling video {i+1}/{total_videos}...')
+                schedule_datetime = schedule_plan['start_datetime'] + (i * schedule_plan['interval'])
+                schedule_iso_string = schedule_datetime.isoformat() + "Z"
+                print(f"This video will be scheduled for: {schedule_datetime.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            if upload_id:
-                successful_uploads.append({'title': job_title, 'id': upload_id})
+                status_callback(f'Uploading video {i+1}/{total_videos}...')
+                upload_id = upload_video(
+                    self.youtube_service, video_path, job_title, job['description'],
+                    tags=["shorts", "your-custom-tag"], channel_name=self.channel_name,
+                    publish_at=schedule_iso_string
+                )
 
-            if job['type'] == 're-upload' and os.path.exists(video_path):
-                os.remove(video_path)
-                print(f"Cleaned up downloaded file: {video_path}")
-            
+                if upload_id:
+                    successful_uploads.append({'title': job_title, 'id': upload_id})
+
+            except Exception as e:
+                print(f"An unexpected error occurred while processing '{job_title}': {e}")
+                traceback.print_exc()  # Print full error to the log for debugging
+
+            finally:
+                # This block is guaranteed to run, ensuring cleanup happens.
+                # We only delete files that were downloaded for a 're-upload' job.
+                if job['type'] == 're-upload' and video_path and os.path.exists(video_path):
+                    try:
+                        os.remove(video_path)
+                        print(f"Cleaned up downloaded file: {video_path}")
+                    except OSError as e:
+                        print(f"Error: Failed to clean up file {video_path}. Reason: {e}")
+
             # Update progress
             progress = ((i + 1) / total_videos) * 100
             self.task_queue.put(('PROGRESS_UPDATE', progress))
