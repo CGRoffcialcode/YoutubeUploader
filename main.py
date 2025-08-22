@@ -116,6 +116,12 @@ def get_authenticated_service():
         error_body += f"Error: {e}\n\n"
         error_body += "Traceback:\n"
         error_body += traceback.format_exc()
+        # Also print the error to the console for easier debugging,
+        # especially if email alerts are not configured.
+        print("\n" + "="*80)
+        print("!!! AUTHENTICATION ERROR !!!")
+        print(error_body)
+        print("="*80 + "\n")
         send_error_email("Authentication Failure", error_body)
         # Return None to stop the app gracefully
         return None, None
